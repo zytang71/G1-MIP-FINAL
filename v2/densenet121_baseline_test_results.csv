@@ -1,0 +1,2 @@
+﻿model,threshold,best_epoch,best_val_loss,test_images,tp,fn,fp,tn,accuracy,recall,precision,specificity,f1,total_inference_time_sec,avg_time_per_image_ms,throughput_images_per_sec,total_params,trainable_params,model_size_mb,batch_size,device
+DenseNet-121 Baseline,0.5,3,0.5436205685138702,624,229,83,101,211,0.705128205116905,0.7339743589508342,0.6939393939183655,0.6762820512603755,0.7133956336109899,0.4460053999791853,0.7147522435563867,1399.0861994700547,6954881,6954881,26.850780487060547,32,cuda

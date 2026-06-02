@@ -1,0 +1,12 @@
+# 資料處理與分析
+pandas
+numpy
+scikit-learn
+
+# 影像處理
+Pillow
+opencv-python
+matplotlib
+
+# 環境穩定 (解決你遇到的 OMP Error)
+nomkl
