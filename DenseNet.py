@@ -11,21 +11,6 @@ from PIL import Image
 import pandas as pd
 from sklearn.metrics import confusion_matrix, classification_report
 
-
-
-
-
-
-
-##                  要先整理資料夾，然後接著把改好的模型拿去試試看
-
-
-
-
-
-
-
-
 # ==========================================
 # 1. 參數設定
 # ==========================================

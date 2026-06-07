@@ -122,15 +122,21 @@ def train():
 
     # 建立模型：使用 MobileNetV2，輸出 14 個 logits (配合 BCEWithLogitsLoss)
     model = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.IMAGENET1K_V1)
+    # 增加 Dropout 比例以減緩 Overfitting
+    model.classifier[0] = nn.Dropout(p=0.5, inplace=False)
     model.classifier[1] = nn.Linear(model.classifier[1].in_features, NUM_CLASSES) 
     model.to(DEVICE)
 
     # 損失函數與優化器
-    criterion = nn.BCEWithLogitsLoss() # 支援混合精度且數值更穩定
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5)
+    # 針對極度不平衡的資料集，給予正樣本 10 倍的懲罰權重
+    pos_weight = torch.ones([NUM_CLASSES]).to(DEVICE) * 10.0
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight) 
+    # 提高 weight_decay (L2正則化) 來減輕 Overfitting (從 1e-5 提高到 1e-4)
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
     scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
-    early_stopping = EarlyStopping(patience=7, path='best_model_multilabel.pth')
+    # 放寬 early stopping，避免太早停下來
+    early_stopping = EarlyStopping(patience=15, path='best_model_multilabel.pth')
 
     for epoch in range(MAX_EPOCHS):
         start_time = time.time()
