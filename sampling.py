@@ -9,9 +9,18 @@ TARGET_TOTAL_SAMPLES = 12500
 TRAIN_RATIO = 0.8
 VALID_RATIO = 0.1
 TEST_RATIO = 0.1
-NEGATIVE_RATIO = 0.2
+
+# Train 改成更接近真實分布，避免模型被過度平衡的資料帶偏
+TRAIN_NEGATIVE_RATIO = 0.45
+
+# Valid / Test 保留較高的陽性覆蓋，方便評估各類別
+EVAL_NEGATIVE_RATIO = 0.20
+
 SPLIT_SEARCH_TRIALS = 300
 BASE_RANDOM_STATE = 42
+
+# Train 抽樣只做「保底」，不再把稀有類別硬塞滿
+TRAIN_MIN_POSITIVE_PER_DISEASE = 60
 
 ALL_DISEASES = [
     "Atelectasis",
@@ -55,7 +64,7 @@ def add_label_columns(df):
 
 
 # ==========================================
-# 3. 病人層級切分
+# 3. 病人層級切分搜尋
 # ==========================================
 def compute_split_score(train_df, valid_df, test_df):
     train_counts = train_df[ALL_DISEASES].sum()
@@ -108,35 +117,128 @@ def search_best_group_split(df):
 
 
 # ==========================================
-# 4. 各 split 內做 14 類導向抽樣
+# 4. 抽樣工具
 # ==========================================
-def choose_seed_samples(label_matrix, disease_order):
+def summarize_sampled_dataset(df, split_name, target_size):
+    positive_counts = df[ALL_DISEASES].sum()
+    negative_count = int((df["label_count"] == 0).sum())
+
+    print(f"\n[{split_name}] 抽樣結果")
+    print(f"  目標筆數: {target_size}")
+    print(f"  實際筆數: {len(df)}")
+    print(f"  全陰性筆數: {negative_count}")
+    print("  各類別正樣本數:")
+    for disease in ALL_DISEASES:
+        print(f"    - {disease}: {int(positive_counts[disease])}")
+
+
+def build_positive_sampling_weights(positive_df):
+    label_matrix = positive_df[ALL_DISEASES].to_numpy(dtype=np.float64)
+    class_counts = np.maximum(label_matrix.sum(axis=0), 1.0)
+
+    # 稀有類別加一點權重，但不要像先前 greedy 那樣強制灌滿
+    class_weights = 1.0 / np.sqrt(class_counts)
+    label_counts = np.maximum(label_matrix.sum(axis=1), 1.0)
+
+    sample_weights = 1.0 + (label_matrix * class_weights).sum(axis=1) / np.sqrt(label_counts)
+    sample_weights = np.clip(sample_weights, 1e-8, None)
+    return sample_weights / sample_weights.sum()
+
+
+def choose_seed_indices(label_matrix, min_positive_per_disease):
     selected = set()
-    for disease_idx in disease_order:
-        candidates = np.where(label_matrix[:, disease_idx] == 1)[0]
-        for candidate in candidates:
-            if candidate not in selected:
-                selected.add(int(candidate))
+
+    for disease_idx in np.argsort(np.maximum(label_matrix.sum(axis=0), 1)):
+        available_indices = np.where(label_matrix[:, disease_idx] == 1)[0]
+        if len(available_indices) == 0:
+            continue
+
+        target_count = min(min_positive_per_disease, len(available_indices))
+        current_count = 0
+
+        for idx in available_indices:
+            if idx in selected:
+                if label_matrix[idx, disease_idx] == 1:
+                    current_count += 1
+                continue
+
+            selected.add(int(idx))
+            current_count += 1
+
+            if current_count >= target_count:
                 break
+
     return selected
 
 
-def greedy_multilabel_sample(data_frame, target_size, split_name, random_state):
+def sample_train_set(data_frame, target_size, split_name, random_state):
     shuffled = data_frame.sample(frac=1, random_state=random_state).reset_index(drop=True)
-
     positive_df = shuffled[shuffled["label_count"] > 0].reset_index(drop=True)
     negative_df = shuffled[shuffled["label_count"] == 0].reset_index(drop=True)
 
-    target_negatives = min(len(negative_df), int(round(target_size * NEGATIVE_RATIO)))
+    target_negatives = min(len(negative_df), int(round(target_size * TRAIN_NEGATIVE_RATIO)))
+    target_positives = min(len(positive_df), target_size - target_negatives)
+
+    label_matrix = positive_df[ALL_DISEASES].to_numpy(dtype=np.int32)
+    seed_indices = choose_seed_indices(label_matrix, TRAIN_MIN_POSITIVE_PER_DISEASE)
+
+    rng = np.random.default_rng(random_state)
+    positive_weights = build_positive_sampling_weights(positive_df)
+
+    remaining_indices = np.array([idx for idx in range(len(positive_df)) if idx not in seed_indices], dtype=np.int32)
+    remaining_slots = max(target_positives - len(seed_indices), 0)
+
+    selected_indices = list(sorted(seed_indices))
+    if remaining_slots > 0 and len(remaining_indices) > 0:
+        remaining_weights = positive_weights[remaining_indices]
+        remaining_weights = remaining_weights / remaining_weights.sum()
+        extra_indices = rng.choice(
+            remaining_indices,
+            size=min(remaining_slots, len(remaining_indices)),
+            replace=False,
+            p=remaining_weights,
+        )
+        selected_indices.extend(sorted(int(idx) for idx in extra_indices))
+
+    selected_positive_df = positive_df.iloc[sorted(set(selected_indices))].copy()
+    selected_negative_df = negative_df.sample(
+        n=target_negatives,
+        random_state=random_state,
+        replace=False,
+    ) if target_negatives > 0 else negative_df.iloc[0:0].copy()
+
+    combined = pd.concat([selected_positive_df, selected_negative_df], ignore_index=True)
+
+    if len(combined) < target_size:
+        used_images = set(combined["Image Index"].tolist())
+        fallback_pool = shuffled[~shuffled["Image Index"].isin(used_images)]
+        fill_count = min(target_size - len(combined), len(fallback_pool))
+        if fill_count > 0:
+            combined = pd.concat([combined, fallback_pool.iloc[:fill_count].copy()], ignore_index=True)
+
+    combined = combined.sample(frac=1, random_state=random_state).reset_index(drop=True)
+    summarize_sampled_dataset(combined, split_name, target_size)
+    return combined
+
+
+def sample_eval_set(data_frame, target_size, split_name, random_state):
+    shuffled = data_frame.sample(frac=1, random_state=random_state).reset_index(drop=True)
+    positive_df = shuffled[shuffled["label_count"] > 0].reset_index(drop=True)
+    negative_df = shuffled[shuffled["label_count"] == 0].reset_index(drop=True)
+
+    target_negatives = min(len(negative_df), int(round(target_size * EVAL_NEGATIVE_RATIO)))
     target_positives = min(len(positive_df), target_size - target_negatives)
 
     label_matrix = positive_df[ALL_DISEASES].to_numpy(dtype=np.int32)
     class_availability = np.maximum(label_matrix.sum(axis=0), 1)
     rarity_weights = 1.0 / class_availability
-    disease_order = np.argsort(class_availability)
 
-    selected = choose_seed_samples(label_matrix, disease_order)
-    class_counts = label_matrix[list(selected)].sum(axis=0).astype(np.int32) if selected else np.zeros(len(ALL_DISEASES), dtype=np.int32)
+    selected = choose_seed_indices(label_matrix, min_positive_per_disease=1)
+    class_counts = (
+        label_matrix[list(selected)].sum(axis=0).astype(np.int32)
+        if selected
+        else np.zeros(len(ALL_DISEASES), dtype=np.int32)
+    )
 
     while len(selected) < target_positives:
         remaining_indices = [idx for idx in range(len(positive_df)) if idx not in selected]
@@ -147,6 +249,7 @@ def greedy_multilabel_sample(data_frame, target_size, split_name, random_state):
         scores = (remaining_matrix * (rarity_weights / (class_counts + 1.0))).sum(axis=1)
         best_offset = int(np.argmax(scores))
         best_index = remaining_indices[best_offset]
+
         selected.add(best_index)
         class_counts += label_matrix[best_index]
 
@@ -156,25 +259,14 @@ def greedy_multilabel_sample(data_frame, target_size, split_name, random_state):
     combined = pd.concat([selected_positive_df, selected_negative_df], ignore_index=True)
 
     if len(combined) < target_size:
-        used_indices = set(combined["Image Index"].tolist())
-        fallback_pool = shuffled[~shuffled["Image Index"].isin(used_indices)]
+        used_images = set(combined["Image Index"].tolist())
+        fallback_pool = shuffled[~shuffled["Image Index"].isin(used_images)]
         fill_count = min(target_size - len(combined), len(fallback_pool))
         if fill_count > 0:
             combined = pd.concat([combined, fallback_pool.iloc[:fill_count].copy()], ignore_index=True)
 
     combined = combined.sample(frac=1, random_state=random_state).reset_index(drop=True)
-
-    positive_counts = combined[ALL_DISEASES].sum()
-    negative_count = int((combined["label_count"] == 0).sum())
-
-    print(f"\n[{split_name}] 抽樣結果")
-    print(f"  目標數量: {target_size}")
-    print(f"  實際數量: {len(combined)}")
-    print(f"  全陰性影像數: {negative_count}")
-    print("  各疾病正樣本數:")
-    for disease in ALL_DISEASES:
-        print(f"    - {disease}: {int(positive_counts[disease])}")
-
+    summarize_sampled_dataset(combined, split_name, target_size)
     return combined
 
 
@@ -183,30 +275,32 @@ def greedy_multilabel_sample(data_frame, target_size, split_name, random_state):
 # ==========================================
 def print_dataset_stats(df, title):
     print(f"\n>>> [{title}]")
-    print(f"  影像數量: {len(df)}")
-    print(f"  病人數量: {df['Patient ID'].nunique()}")
-    print(f"  全陰性影像數: {(df['label_count'] == 0).sum()}")
-    print("  各疾病總正樣本數:")
+    print(f"  總筆數: {len(df)}")
+    print(f"  病人數: {df['Patient ID'].nunique()}")
+    print(f"  全陰性筆數: {(df['label_count'] == 0).sum()}")
+    print("  各類別在此集合的正樣本數:")
     for disease in ALL_DISEASES:
         print(f"    - {disease}: {int(df[disease].sum())}")
 
 
 # ==========================================
-# 6. 主流程
+# 6. 主程式
 # ==========================================
 def main():
     print("=" * 60)
-    print("從 NIH Chest X-ray 重新抽樣 14 類多標籤資料集")
+    print("從 NIH Chest X-ray 重新抽樣 14 類多標籤資料")
     print("=" * 60)
+    print("Train: 較自然分布 + 類別保底")
+    print("Valid/Test: 保留每類覆蓋，方便評估")
 
     df = pd.read_csv(CSV_PATH)
     df = add_label_columns(df)
 
-    print_dataset_stats(df, "完整 NIH 資料集")
+    print_dataset_stats(df, "原始 NIH 全資料")
 
-    print("\n[搜尋病人層級切分，盡量讓 14 類在 train/valid/test 都有樣本...]")
+    print("\n[開始搜尋病人層級 train/valid/test 切分...]")
     train_df, valid_df, test_df, best_seed = search_best_group_split(df)
-    print(f"  使用 random_state = {best_seed}")
+    print(f"  最佳 random_state = {best_seed}")
 
     train_patients = set(train_df["Patient ID"])
     valid_patients = set(valid_df["Patient ID"])
@@ -216,25 +310,25 @@ def main():
     print(f"  Train/Test 重疊病人數: {len(train_patients.intersection(test_patients))}")
     print(f"  Valid/Test 重疊病人數: {len(valid_patients.intersection(test_patients))}")
 
-    print_dataset_stats(train_df, "切分後候選 Train")
-    print_dataset_stats(valid_df, "切分後候選 Valid")
-    print_dataset_stats(test_df, "切分後候選 Test")
+    print_dataset_stats(train_df, "切分後原始 Train")
+    print_dataset_stats(valid_df, "切分後原始 Valid")
+    print_dataset_stats(test_df, "切分後原始 Test")
 
     train_size = int(TARGET_TOTAL_SAMPLES * TRAIN_RATIO)
     valid_size = int(TARGET_TOTAL_SAMPLES * VALID_RATIO)
     test_size = int(TARGET_TOTAL_SAMPLES * TEST_RATIO)
 
-    print("\n[在各 split 內進行 14 類導向抽樣...]")
-    train_final = greedy_multilabel_sample(train_df, train_size, "Train", best_seed)
-    valid_final = greedy_multilabel_sample(valid_df, valid_size, "Valid", best_seed + 1)
-    test_final = greedy_multilabel_sample(test_df, test_size, "Test", best_seed + 2)
+    print("\n[開始依新策略抽樣...]")
+    train_final = sample_train_set(train_df, train_size, "Train", best_seed)
+    valid_final = sample_eval_set(valid_df, valid_size, "Valid", best_seed + 1)
+    test_final = sample_eval_set(test_df, test_size, "Test", best_seed + 2)
 
     train_final.to_csv("Data/train_list.csv", index=False)
     valid_final.to_csv("Data/valid_list.csv", index=False)
     test_final.to_csv("Data/test_list.csv", index=False)
 
     print("\n" + "=" * 60)
-    print("抽樣完成，已輸出新的資料清單")
+    print("抽樣完成，已輸出以下檔案")
     print("  1. Data/train_list.csv")
     print("  2. Data/valid_list.csv")
     print("  3. Data/test_list.csv")
