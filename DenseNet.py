@@ -31,6 +31,7 @@ ALL_DISEASES = [
     "Hernia",
 ]
 NUM_CLASSES = len(ALL_DISEASES)
+MONITOR_DISEASES = [disease for disease in ALL_DISEASES if disease != "Hernia"]
 
 TRAIN_CSV = "Data/train_list.csv"
 VALID_CSV = "Data/valid_list.csv"
@@ -41,10 +42,13 @@ IMG_SIZE = 224
 BATCH_SIZE = 32
 MAX_EPOCHS = 50
 LEARNING_RATE = 5e-5
-MAX_POS_WEIGHT = 10.0
+WEIGHT_DECAY = 5e-4
+GRAD_CLIP_NORM = 1.0
+ASL_GAMMA_NEG = 4.0
+ASL_GAMMA_POS = 1.0
+ASL_CLIP = 0.05
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BEST_MODEL_PATH = "best_densenet_multilabel.pth"
-MONITOR_DISEASES = [disease for disease in ALL_DISEASES if disease != "Hernia"]
 
 
 # ==========================================
@@ -73,7 +77,7 @@ class ApplyCLAHE(object):
 # 2. Early Stopping
 # ==========================================
 class EarlyStopping:
-    def __init__(self, patience=15, path=BEST_MODEL_PATH, mode="max"):
+    def __init__(self, patience=10, path=BEST_MODEL_PATH, mode="max"):
         self.patience = patience
         self.path = path
         self.mode = mode
@@ -105,7 +109,40 @@ class EarlyStopping:
 
 
 # ==========================================
-# 3. 多標籤資料集
+# 3. Asymmetric Loss
+# ==========================================
+class AsymmetricLoss(nn.Module):
+    def __init__(self, gamma_neg=4.0, gamma_pos=1.0, clip=0.05, eps=1e-8):
+        super().__init__()
+        self.gamma_neg = gamma_neg
+        self.gamma_pos = gamma_pos
+        self.clip = clip
+        self.eps = eps
+
+    def forward(self, logits, targets):
+        probs = torch.sigmoid(logits)
+        pos_probs = probs
+        neg_probs = 1.0 - probs
+
+        if self.clip is not None and self.clip > 0:
+            neg_probs = torch.clamp(neg_probs + self.clip, max=1.0)
+
+        pos_loss = targets * torch.log(torch.clamp(pos_probs, min=self.eps))
+        neg_loss = (1.0 - targets) * torch.log(torch.clamp(neg_probs, min=self.eps))
+
+        if self.gamma_pos > 0 or self.gamma_neg > 0:
+            pt = pos_probs * targets + neg_probs * (1.0 - targets)
+            gamma = self.gamma_pos * targets + self.gamma_neg * (1.0 - targets)
+            focal_weight = torch.pow(1.0 - pt, gamma)
+            pos_loss = pos_loss * focal_weight
+            neg_loss = neg_loss * focal_weight
+
+        loss = -(pos_loss + neg_loss)
+        return loss.mean()
+
+
+# ==========================================
+# 4. 多標籤資料集
 # ==========================================
 class ChestXrayMultiLabelDataset(Dataset):
     def __init__(self, csv_file, img_dir, transform=None):
@@ -129,27 +166,14 @@ class ChestXrayMultiLabelDataset(Dataset):
         return image, torch.tensor(label_list, dtype=torch.float32)
 
 
-def compute_pos_weights(csv_file):
+def print_train_distribution(csv_file):
     df = pd.read_csv(csv_file)
     findings = df["Finding Labels"].fillna("")
-    weights = []
 
-    print("\n[根據訓練集自動計算各類別 pos_weight]")
-    print("  公式: pos_weight = negative_count / positive_count")
-    print(f"  為避免極少數類別權重過大，這裡設定上限為 {MAX_POS_WEIGHT:.1f}")
-
+    print("\n[訓練集各類別正樣本數]")
     for disease in ALL_DISEASES:
         positive_count = findings.str.split("|").apply(lambda labels: disease in labels).sum()
-        negative_count = len(df) - positive_count
-        raw_weight = negative_count / max(positive_count, 1)
-        clipped_weight = min(raw_weight, MAX_POS_WEIGHT)
-        weights.append(clipped_weight)
-        print(
-            f"  - {disease}: positive={positive_count}, negative={negative_count}, "
-            f"raw={raw_weight:.4f}, used={clipped_weight:.4f}"
-        )
-
-    return torch.tensor(weights, dtype=torch.float32, device=DEVICE)
+        print(f"  - {disease}: {positive_count}")
 
 
 def compute_macro_metrics(preds, labels, disease_names):
@@ -179,7 +203,7 @@ def compute_macro_metrics(preds, labels, disease_names):
 
 
 # ==========================================
-# 4. 建立模型 DenseNet-121
+# 5. 建立模型 DenseNet-121
 # ==========================================
 def build_model():
     model = models.densenet121(weights=models.DenseNet121_Weights.IMAGENET1K_V1)
@@ -188,10 +212,14 @@ def build_model():
 
 
 # ==========================================
-# 5. 訓練流程
+# 6. 訓練流程
 # ==========================================
 def train():
     print(f"開始進行 DenseNet-121 多標籤訓練 | 裝置: {DEVICE}")
+    print(
+        f"Loss: Asymmetric Loss | gamma_neg={ASL_GAMMA_NEG}, "
+        f"gamma_pos={ASL_GAMMA_POS}, clip={ASL_CLIP}"
+    )
 
     train_trans = transforms.Compose(
         [
@@ -228,10 +256,15 @@ def train():
         pin_memory=torch.cuda.is_available(),
     )
 
+    print_train_distribution(TRAIN_CSV)
+
     model = build_model()
-    pos_weight = compute_pos_weights(TRAIN_CSV)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=3e-4)
+    criterion = AsymmetricLoss(
+        gamma_neg=ASL_GAMMA_NEG,
+        gamma_pos=ASL_GAMMA_POS,
+        clip=ASL_CLIP,
+    )
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="max",
@@ -256,12 +289,15 @@ def train():
                     logits = model(imgs)
                     loss = criterion(logits, lbls)
                 scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 logits = model(imgs)
                 loss = criterion(logits, lbls)
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
                 optimizer.step()
 
             train_loss += loss.item()
