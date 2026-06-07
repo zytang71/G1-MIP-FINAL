@@ -40,10 +40,11 @@ VALID_DIR = "split_dataset/valid"
 IMG_SIZE = 224
 BATCH_SIZE = 32
 MAX_EPOCHS = 50
-LEARNING_RATE = 1e-4
+LEARNING_RATE = 5e-5
 MAX_POS_WEIGHT = 10.0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BEST_MODEL_PATH = "best_densenet_multilabel.pth"
+MONITOR_DISEASES = [disease for disease in ALL_DISEASES if disease != "Hernia"]
 
 
 # ==========================================
@@ -72,26 +73,31 @@ class ApplyCLAHE(object):
 # 2. Early Stopping
 # ==========================================
 class EarlyStopping:
-    def __init__(self, patience=15, path=BEST_MODEL_PATH):
+    def __init__(self, patience=15, path=BEST_MODEL_PATH, mode="max"):
         self.patience = patience
         self.path = path
+        self.mode = mode
         self.counter = 0
-        self.best_loss = None
+        self.best_value = None
         self.early_stop = False
 
-    def __call__(self, val_loss, model):
-        if self.best_loss is None:
-            self.best_loss = val_loss
+    def _is_improved(self, current_value):
+        if self.best_value is None:
+            return True
+        if self.mode == "min":
+            return current_value < self.best_value
+        return current_value > self.best_value
+
+    def __call__(self, current_value, model):
+        if self._is_improved(current_value):
+            self.best_value = current_value
             self.save_checkpoint(model)
-        elif val_loss > self.best_loss:
+            self.counter = 0
+        else:
             self.counter += 1
             print(f"  -> Early Stopping 計數: {self.counter} / {self.patience}")
             if self.counter >= self.patience:
                 self.early_stop = True
-        else:
-            self.best_loss = val_loss
-            self.save_checkpoint(model)
-            self.counter = 0
 
     def save_checkpoint(self, model):
         torch.save(model.state_dict(), self.path)
@@ -146,6 +152,32 @@ def compute_pos_weights(csv_file):
     return torch.tensor(weights, dtype=torch.float32, device=DEVICE)
 
 
+def compute_macro_metrics(preds, labels, disease_names):
+    precisions = []
+    recalls = []
+    f1_scores = []
+
+    for disease in disease_names:
+        idx = ALL_DISEASES.index(disease)
+        tp = ((preds[:, idx] == 1) & (labels[:, idx] == 1)).sum()
+        fp = ((preds[:, idx] == 1) & (labels[:, idx] == 0)).sum()
+        fn = ((preds[:, idx] == 0) & (labels[:, idx] == 1)).sum()
+
+        precision = tp / (tp + fp + 1e-8)
+        recall = tp / (tp + fn + 1e-8)
+        f1 = 2 * precision * recall / (precision + recall + 1e-8)
+
+        precisions.append(precision)
+        recalls.append(recall)
+        f1_scores.append(f1)
+
+    return {
+        "precision": float(np.mean(precisions)) if precisions else 0.0,
+        "recall": float(np.mean(recalls)) if recalls else 0.0,
+        "f1": float(np.mean(f1_scores)) if f1_scores else 0.0,
+    }
+
+
 # ==========================================
 # 4. 建立模型 DenseNet-121
 # ==========================================
@@ -167,6 +199,7 @@ def train():
             transforms.Resize((IMG_SIZE, IMG_SIZE)),
             transforms.RandomHorizontalFlip(),
             transforms.RandomRotation(10),
+            transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.95, 1.05)),
             transforms.ToTensor(),
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ]
@@ -198,15 +231,15 @@ def train():
     model = build_model()
     pos_weight = compute_pos_weights(TRAIN_CSV)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=3e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
-        mode="min",
+        mode="max",
         factor=0.5,
         patience=2,
     )
     scaler = torch.amp.GradScaler("cuda") if torch.cuda.is_available() else None
-    early_stopping = EarlyStopping(patience=15, path=BEST_MODEL_PATH)
+    early_stopping = EarlyStopping(patience=10, path=BEST_MODEL_PATH, mode="max")
 
     for epoch in range(MAX_EPOCHS):
         start_time = time.time()
@@ -258,27 +291,27 @@ def train():
         all_preds = np.vstack(all_preds)
         all_lbls = np.vstack(all_lbls)
 
-        recalls = []
-        for idx in range(NUM_CLASSES):
-            tp = ((all_preds[:, idx] == 1) & (all_lbls[:, idx] == 1)).sum()
-            fn = ((all_preds[:, idx] == 0) & (all_lbls[:, idx] == 1)).sum()
-            if (tp + fn) > 0:
-                recalls.append(tp / (tp + fn))
-        macro_recall = np.mean(recalls) if recalls else 0.0
+        full_metrics = compute_macro_metrics(all_preds, all_lbls, ALL_DISEASES)
+        core_metrics = compute_macro_metrics(all_preds, all_lbls, MONITOR_DISEASES)
 
         avg_train_loss = train_loss / len(train_loader)
         avg_val_loss = val_loss / len(val_loader)
 
+        print(f"Epoch [{epoch + 1}] Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
         print(
-            f"Epoch [{epoch + 1}] Train Loss: {avg_train_loss:.4f} | "
-            f"Val Loss: {avg_val_loss:.4f} | Macro-Recall: {macro_recall:.2%}"
+            f"  全 14 類 Macro -> P: {full_metrics['precision']:.2%} | "
+            f"R: {full_metrics['recall']:.2%} | F1: {full_metrics['f1']:.2%}"
+        )
+        print(
+            f"  排除 Hernia -> P: {core_metrics['precision']:.2%} | "
+            f"R: {core_metrics['recall']:.2%} | F1: {core_metrics['f1']:.2%}"
         )
 
-        scheduler.step(avg_val_loss)
-        early_stopping(avg_val_loss, model)
+        scheduler.step(core_metrics["f1"])
+        early_stopping(core_metrics["f1"], model)
 
         if early_stopping.early_stop:
-            print(f">>> 驗證損失連續 {early_stopping.patience} 個 epoch 沒有進步，提前停止訓練。")
+            print(f">>> 排除 Hernia 的驗證 Macro-F1 連續 {early_stopping.patience} 個 epoch 沒有進步，提前停止訓練。")
             break
 
         print(f"  耗時: {time.time() - start_time:.1f}s")

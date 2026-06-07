@@ -34,6 +34,7 @@ ALL_DISEASES = [
     "Pleural_Thickening",
     "Hernia",
 ]
+MONITOR_DISEASES = [disease for disease in ALL_DISEASES if disease != "Hernia"]
 NUM_CLASSES = len(ALL_DISEASES)
 
 
@@ -80,6 +81,40 @@ class ChestXrayTestMultiLabelDataset(torch.utils.data.Dataset):
         return image, torch.tensor(label_list, dtype=torch.float32)
 
 
+def compute_per_class_metrics(all_labels, all_preds):
+    metrics = {}
+
+    for i, disease in enumerate(ALL_DISEASES):
+        cm = confusion_matrix(all_labels[:, i], all_preds[:, i], labels=[0, 1])
+        if cm.shape == (2, 2):
+            tn, fp, fn, tp = cm.ravel()
+        else:
+            tn, fp, fn, tp = 0, 0, 0, 0
+
+        recall = tp / (tp + fn + 1e-8)
+        precision = tp / (tp + fp + 1e-8)
+        specificity = tn / (tn + fp + 1e-8)
+        f1 = 2 * precision * recall / (precision + recall + 1e-8)
+
+        metrics[disease] = {
+            "recall": recall,
+            "precision": precision,
+            "specificity": specificity,
+            "f1": f1,
+        }
+
+    return metrics
+
+
+def summarize_macro(metrics, disease_names):
+    return {
+        "precision": float(np.mean([metrics[d]["precision"] for d in disease_names])),
+        "recall": float(np.mean([metrics[d]["recall"] for d in disease_names])),
+        "specificity": float(np.mean([metrics[d]["specificity"] for d in disease_names])),
+        "f1": float(np.mean([metrics[d]["f1"] for d in disease_names])),
+    }
+
+
 # ==========================================
 # 3. 測試流程
 # ==========================================
@@ -124,6 +159,9 @@ def evaluate_test_set():
 
     all_labels = np.vstack(all_labels)
     all_preds = np.vstack(all_preds)
+    metrics = compute_per_class_metrics(all_labels, all_preds)
+    full_macro = summarize_macro(metrics, ALL_DISEASES)
+    core_macro = summarize_macro(metrics, MONITOR_DISEASES)
 
     print("\n" + "=" * 60)
     print("多標籤疾病分類 - MobileNet 測試結果")
@@ -131,34 +169,30 @@ def evaluate_test_set():
     print(f"{'Disease':<20} | {'Recall':<8} | {'Precision':<9} | {'Specificity':<11} | {'F1-Score':<8}")
     print("-" * 65)
 
-    recalls, precisions, specificities, f1_scores = [], [], [], []
-
-    for i, disease in enumerate(ALL_DISEASES):
-        cm = confusion_matrix(all_labels[:, i], all_preds[:, i], labels=[0, 1])
-        if cm.shape == (2, 2):
-            tn, fp, fn, tp = cm.ravel()
-        else:
-            tn, fp, fn, tp = 0, 0, 0, 0
-
-        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
-
-        recalls.append(recall)
-        precisions.append(precision)
-        specificities.append(specificity)
-        f1_scores.append(f1)
-
-        print(f"{disease:<20} | {recall:>7.2%} | {precision:>8.2%} | {specificity:>10.2%} | {f1:>7.2%}")
+    for disease in ALL_DISEASES:
+        result = metrics[disease]
+        print(
+            f"{disease:<20} | "
+            f"{result['recall']:>7.2%} | "
+            f"{result['precision']:>8.2%} | "
+            f"{result['specificity']:>10.2%} | "
+            f"{result['f1']:>7.2%}"
+        )
 
     print("-" * 65)
     print(
-        f"{'Macro Average':<20} | "
-        f"{np.mean(recalls):>7.2%} | "
-        f"{np.mean(precisions):>8.2%} | "
-        f"{np.mean(specificities):>10.2%} | "
-        f"{np.mean(f1_scores):>7.2%}"
+        f"{'全 14 類 Macro':<20} | "
+        f"{full_macro['recall']:>7.2%} | "
+        f"{full_macro['precision']:>8.2%} | "
+        f"{full_macro['specificity']:>10.2%} | "
+        f"{full_macro['f1']:>7.2%}"
+    )
+    print(
+        f"{'排除 Hernia':<20} | "
+        f"{core_macro['recall']:>7.2%} | "
+        f"{core_macro['precision']:>8.2%} | "
+        f"{core_macro['specificity']:>10.2%} | "
+        f"{core_macro['f1']:>7.2%}"
     )
     print("=" * 60)
 
