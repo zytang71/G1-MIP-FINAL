@@ -1,4 +1,5 @@
 import os
+import json
 
 import cv2
 import numpy as np
@@ -16,6 +17,7 @@ from torchvision import models, transforms
 TEST_DIR = "split_dataset/test"
 TEST_CSV = "Data/test_list.csv"
 MODEL_PATH = "best_model_multilabel.pth"
+THRESHOLD_PATH = "mobilenet_thresholds.json"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 ALL_DISEASES = [
@@ -115,6 +117,21 @@ def summarize_macro(metrics, disease_names):
     }
 
 
+def load_thresholds():
+    default_thresholds = {disease: 0.5 for disease in ALL_DISEASES}
+    if not os.path.exists(THRESHOLD_PATH):
+        print(f"未找到 {THRESHOLD_PATH}，使用預設 threshold=0.5")
+        return default_thresholds
+
+    with open(THRESHOLD_PATH, "r", encoding="utf-8") as file:
+        payload = json.load(file)
+
+    loaded = payload.get("thresholds", {})
+    thresholds = {disease: float(loaded.get(disease, 0.5)) for disease in ALL_DISEASES}
+    print(f"已載入各類別 threshold 設定: {THRESHOLD_PATH}")
+    return thresholds
+
+
 # ==========================================
 # 3. 測試流程
 # ==========================================
@@ -140,6 +157,7 @@ def evaluate_test_set():
     model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
     model.to(DEVICE)
     model.eval()
+    thresholds = load_thresholds()
 
     all_labels = []
     all_preds = []
@@ -152,7 +170,12 @@ def evaluate_test_set():
             logits = model(images)
 
             probs = torch.sigmoid(logits)
-            preds = (probs > 0.5).float()
+            threshold_tensor = torch.tensor(
+                [thresholds[disease] for disease in ALL_DISEASES],
+                device=DEVICE,
+                dtype=probs.dtype,
+            )
+            preds = (probs >= threshold_tensor).float()
 
             all_labels.append(labels.cpu().numpy())
             all_preds.append(preds.cpu().numpy())
@@ -195,6 +218,9 @@ def evaluate_test_set():
         f"{core_macro['f1']:>7.2%}"
     )
     print("=" * 60)
+    print("各類別 threshold:")
+    for disease in ALL_DISEASES:
+        print(f"  - {disease}: {thresholds[disease]:.2f}")
 
 
 if __name__ == "__main__":
