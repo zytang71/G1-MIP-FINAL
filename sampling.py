@@ -5,7 +5,7 @@ import pandas as pd
 # 1. 基本設定
 # ==========================================
 CSV_PATH = "Data_Entry_2017.csv"
-TARGET_TOTAL_SAMPLES = 6250
+TARGET_TOTAL_SAMPLES = 12500
 TRAIN_RATIO = 0.8
 VALID_RATIO = 0.1
 TEST_RATIO = 0.1
