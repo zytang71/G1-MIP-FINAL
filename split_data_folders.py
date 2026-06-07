@@ -13,9 +13,9 @@ DEST_ROOT = 'split_dataset/'
 
 # 對應的三個 CSV 檔案名稱
 CSV_FILES = {
-    'train': 'train_list/train_list.csv',
-    'valid': 'train_list/valid_list.csv',
-    'test': 'train_list/test_list.csv'
+    'train': 'Data/train_list.csv',
+    'valid': 'Data/valid_list.csv',
+    'test': 'Data/test_list.csv'
 }
 
 # ==========================================

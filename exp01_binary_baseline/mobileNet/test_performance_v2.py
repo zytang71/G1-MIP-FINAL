@@ -14,7 +14,7 @@ import numpy as np
 # 1. 參數與路徑 (請確認與訓練一致)
 # ==========================================
 TEST_DIR = 'split_dataset/test'
-TEST_CSV = 'train_list/test_list.csv'
+TEST_CSV = 'Data/test_list.csv'
 MODEL_PATH = 'best_model_standard.pth' # 請確認檔名是否為 best_model_final.pth
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 IMG_SIZE = 448 # 必須與訓練時一致

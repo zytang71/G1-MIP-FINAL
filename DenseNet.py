@@ -12,6 +12,20 @@ import pandas as pd
 from sklearn.metrics import confusion_matrix, classification_report
 
 
+
+
+
+
+
+##                  要先整理資料夾，然後接著把改好的模型拿去試試看
+
+
+
+
+
+
+
+
 # ==========================================
 # 1. 參數設定
 # ==========================================
@@ -19,14 +33,19 @@ TRAIN_DIR = '../split_dataset/train'
 VALID_DIR = '../split_dataset/valid'
 TEST_DIR = '../split_dataset/test'
 
-TRAIN_CSV = '../train_list/train_list.csv'
-VALID_CSV = '../train_list/valid_list.csv'
-TEST_CSV = '../train_list/test_list.csv'
+TRAIN_CSV = '../Data/train_list.csv'
+VALID_CSV = '../Data/valid_list.csv'
+TEST_CSV = '../Data/test_list.csv'
 
 BATCH_SIZE = 32
 EPOCHS = 50
 LEARNING_RATE = 1e-4
 THRESHOLD = 0.5
+
+ALL_DISEASES = ['Atelectasis', 'Cardiomegaly', 'Effusion', 'Infiltration', 'Mass', 'Nodule', 
+                'Pneumonia', 'Pneumothorax', 'Consolidation', 'Edema', 'Emphysema', 'Fibrosis', 
+                'Pleural_Thickening', 'Hernia']
+RED_INDICES = [2, 4, 6, 7, 8, 9]
 
 # Early Stopping 設定
 PATIENCE = 7
@@ -54,12 +73,13 @@ class ChestXrayDataset(Dataset):
         img_name = os.path.join(self.img_dir, self.data.iloc[idx, 0])
 
         image = Image.open(img_name).convert('RGB')
-        label = self.data.iloc[idx]['target']
+        label_str = str(self.data.iloc[idx]['target'])
+        label_list = [float(x) for x in label_str.split(',')]
 
         if self.transform:
             image = self.transform(image)
 
-        return image, torch.tensor(label, dtype=torch.float32)
+        return image, torch.tensor(label_list, dtype=torch.float32)
 
 
 # ==========================================
@@ -96,9 +116,8 @@ def build_model():
 
     num_ftrs = model.classifier.in_features
 
-    # 二元分類輸出 1 個 logit
-    # 這裡不加 Sigmoid，因為 BCEWithLogitsLoss 會處理
-    model.classifier = nn.Linear(num_ftrs, 1)
+    # 多標籤分類，輸出 14 個 logits (不加 Sigmoid)
+    model.classifier = nn.Linear(num_ftrs, 14)
 
     return model.to(DEVICE)
 
@@ -152,9 +171,8 @@ def evaluate_model(model, data_loader, criterion=None, threshold=0.5, measure_ti
     model.eval()
 
     total_loss = 0.0
-    all_labels = []
-    all_preds = []
-    all_probs = []
+    all_severe_labels = []
+    all_severe_preds = []
 
     total_inference_time = 0.0
 
@@ -178,7 +196,7 @@ def evaluate_model(model, data_loader, criterion=None, threshold=0.5, measure_ti
 
             start_time = time.perf_counter()
 
-            logits = model(images).squeeze(dim=1)
+            logits = model(images)  # Shape: (Batch, 14)
 
             if measure_time and DEVICE.type == "cuda":
                 torch.cuda.synchronize()
@@ -192,14 +210,18 @@ def evaluate_model(model, data_loader, criterion=None, threshold=0.5, measure_ti
                 loss = criterion(logits, labels)
                 total_loss += loss.item()
 
-            probs = torch.sigmoid(logits)
-            preds = (probs >= threshold).float()
+            probs = torch.sigmoid(logits)  # Shape: (Batch, 14)
 
-            all_labels.extend(labels.cpu().numpy())
-            all_preds.extend(preds.cpu().numpy())
-            all_probs.extend(probs.cpu().numpy())
+            # --- 最終嚴重性判定邏輯 ---
+            # 只要有任何一個紅燈疾病的機率 >= threshold，就判斷為嚴重 (1)
+            batch_severe_preds = (probs[:, RED_INDICES].max(dim=1).values >= threshold).float()
+            # 只要真實標籤中有任何一個紅燈疾病是 1，就是嚴重 (1)
+            batch_severe_labels = labels[:, RED_INDICES].max(dim=1).values
 
-    cm = confusion_matrix(all_labels, all_preds, labels=[0, 1])
+            all_severe_labels.extend(batch_severe_labels.cpu().numpy())
+            all_severe_preds.extend(batch_severe_preds.cpu().numpy())
+
+    cm = confusion_matrix(all_severe_labels, all_severe_preds, labels=[0, 1])
     tn, fp, fn, tp = cm.ravel()
 
     metrics = calculate_metrics_from_counts(tp, fn, fp, tn)
@@ -227,9 +249,8 @@ def evaluate_model(model, data_loader, criterion=None, threshold=0.5, measure_ti
         metrics["avg_time_per_image_ms"] = None
         metrics["throughput_images_per_sec"] = None
 
-    metrics["all_labels"] = all_labels
-    metrics["all_preds"] = all_preds
-    metrics["all_probs"] = all_probs
+    metrics["all_labels"] = all_severe_labels
+    metrics["all_preds"] = all_severe_preds
 
     return metrics
 
@@ -299,7 +320,7 @@ def train():
 
             optimizer.zero_grad()
 
-            logits = model(images).squeeze(dim=1)
+            logits = model(images)
             loss = criterion(logits, labels)
 
             loss.backward()

@@ -11,20 +11,34 @@ TRAIN_RATIO = 0.8
 VALID_RATIO = 0.1                 
 TEST_RATIO = 0.1                  
 
-# 紅燈與綠燈疾病定義
+# 所有 14 種疾病清單
+ALL_DISEASES = ['Atelectasis', 'Cardiomegaly', 'Effusion', 'Infiltration', 'Mass', 'Nodule', 
+                'Pneumonia', 'Pneumothorax', 'Consolidation', 'Edema', 'Emphysema', 'Fibrosis', 
+                'Pleural_Thickening', 'Hernia']
+
+# 紅燈疾病定義 (目前僅用於抽樣平衡)
 RED_LIGHT_DISEASES = ['Pneumothorax', 'Edema', 'Pneumonia', 'Consolidation', 'Effusion', 'Mass']
-# 綠燈中除了 "No Finding" 以外的疾病 (僅供統計參考)
-GREEN_OTHER_DISEASES = ['Atelectasis', 'Infiltration', 'Emphysema', 'Fibrosis', 
-                        'Pleural_thickening', 'Nodule', 'Hernia', 'Cardiomegaly']
 
 # ==========================================
 # 2. 輔助函數
 # ==========================================
-def classify_target(finding_labels):
+def classify_severity(finding_labels):
     individual_labels = finding_labels.split('|')
     if any(label in RED_LIGHT_DISEASES for label in individual_labels):
         return 1
     return 0
+
+def create_multi_hot_encoding(finding_labels):
+    """將文字標籤轉換為 14 維 Multi-hot Encoding，以逗號分隔"""
+    labels = finding_labels.lower().split('|')
+    encoded = []
+    for disease in ALL_DISEASES:
+        # 特別注意有些標籤大小寫或底線問題，轉小寫後比較最安全
+        if disease.lower() in labels:
+            encoded.append(1)
+        else:
+            encoded.append(0)
+    return ','.join(map(str, encoded))
 
 def get_detailed_stats(df, title):
     """計算並顯示標籤細節"""
@@ -32,27 +46,24 @@ def get_detailed_stats(df, title):
     print(f"  總影像數: {len(df)}")
     print(f"  總病患數: {df['Patient ID'].nunique()}")
     
-    # 計算各個紅燈病症出現的次數 (因為是多標籤，總和可能超過總圖數)
-    print("  紅燈組成細節:")
-    for disease in RED_LIGHT_DISEASES:
-        count = df['Finding Labels'].str.contains(disease).sum()
-        print(f"    - {disease}: {count}")
-    
-    red_count = (df['target'] == 1).sum()
-    green_count = (df['target'] == 0).sum()
-    print(f"  分類統計: 紅燈 = {red_count} ({red_count/len(df):.1%}), 綠燈 = {green_count} ({green_count/len(df):.1%})")
+    red_count = (df['severity_label'] == 1).sum()
+    green_count = (df['severity_label'] == 0).sum()
+    print(f"  嚴重性統計: 紅燈 = {red_count} ({red_count/len(df):.1%}), 綠燈 = {green_count} ({green_count/len(df):.1%})")
 
 # ==========================================
 # 3. 主流程
 # ==========================================
 def main():
     print("="*50)
-    print("系統啟動：NIH Chest X-ray 資料分流處理")
+    print("系統啟動：NIH Chest X-ray 資料分流處理 (保持 1:1 平衡與舊抽樣數，但輸出 14 維標籤)")
     print("="*50)
 
     # 讀取資料
     df = pd.read_csv(CSV_PATH)
-    df['target'] = df['Finding Labels'].apply(classify_target)
+    # severity_label 用來做後續的平衡抽樣
+    df['severity_label'] = df['Finding Labels'].apply(classify_severity)
+    # target 則是模型真正要訓練的 14 維度目標
+    df['target'] = df['Finding Labels'].apply(create_multi_hot_encoding)
     
     # 顯示原始資料全局資訊
     get_detailed_stats(df, "原始資料集")
@@ -82,8 +93,9 @@ def main():
     # --- 步驟 B: 平衡抽樣 ---
     def balance_sample_verbose(data_frame, target_size, name):
         half_size = target_size // 2
-        reds = data_frame[data_frame['target'] == 1]
-        greens = data_frame[data_frame['target'] == 0]
+        # 改用 severity_label 做平衡
+        reds = data_frame[data_frame['severity_label'] == 1]
+        greens = data_frame[data_frame['severity_label'] == 0]
         
         n_red = min(len(reds), half_size)
         n_green = min(len(greens), n_red) # 強制 1:1
@@ -105,9 +117,9 @@ def main():
     test_final = balance_sample_verbose(test_df, test_size, "測試集 (Test)")
 
     # --- 輸出結果 ---
-    train_final.to_csv('train_list/train_list.csv', index=False)
-    valid_final.to_csv('train_list/valid_list.csv', index=False)
-    test_final.to_csv('train_list/test_list.csv', index=False)
+    train_final.to_csv('Data/train_list.csv', index=False)
+    valid_final.to_csv('Data/valid_list.csv', index=False)
+    test_final.to_csv('Data/test_list.csv', index=False)
 
     print("\n" + "="*50)
     print("任務成功結束！")

@@ -99,9 +99,9 @@ def train():
         transforms.ToTensor(), transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
 
-    train_loader = DataLoader(ChestXrayDataset('train_list/train_list.csv', 'split_dataset/train', train_trans), 
+    train_loader = DataLoader(ChestXrayDataset('Data/train_list.csv', 'split_dataset/train', train_trans), 
                               batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(ChestXrayDataset('train_list/valid_list.csv', 'split_dataset/valid', val_trans), 
+    val_loader = DataLoader(ChestXrayDataset('Data/valid_list.csv', 'split_dataset/valid', val_trans), 
                             batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
 
     # 建立模型：移除最後的 Sigmoid 以配合 BCEWithLogitsLoss

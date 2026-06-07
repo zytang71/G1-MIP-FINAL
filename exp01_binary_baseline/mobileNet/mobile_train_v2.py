@@ -37,8 +37,8 @@ class ApplyCLAHE(object):
 # ==========================================
 TRAIN_DIR = 'split_dataset/train'
 VALID_DIR = 'split_dataset/valid'
-TRAIN_CSV = 'train_list/train_list.csv'  
-VALID_CSV = 'train_list/valid_list.csv'
+TRAIN_CSV = 'Data/train_list.csv'  
+VALID_CSV = 'Data/valid_list.csv'
 
 IMG_SIZE = 448        # 提升至 448x448 以獲取更多細節
 BATCH_SIZE = 32      # 5080 顯存充足，甚至可以試試 64
