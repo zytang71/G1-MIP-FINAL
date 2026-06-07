@@ -1,5 +1,6 @@
 import os
 
+import cv2
 import numpy as np
 import pandas as pd
 import torch
@@ -37,8 +38,27 @@ NUM_CLASSES = len(ALL_DISEASES)
 
 
 # ==========================================
-# 2. 測試資料集
+# 2. 前處理與資料集
 # ==========================================
+class ApplyCLAHE(object):
+    def __init__(self, clip_limit=2.0, tile_grid_size=(8, 8)):
+        self.clip_limit = clip_limit
+        self.tile_grid_size = tile_grid_size
+
+    def __call__(self, img):
+        img_np = np.array(img)
+        lab = cv2.cvtColor(img_np, cv2.COLOR_RGB2LAB)
+        l_channel, a_channel, b_channel = cv2.split(lab)
+        clahe = cv2.createCLAHE(
+            clipLimit=self.clip_limit,
+            tileGridSize=self.tile_grid_size,
+        )
+        cl = clahe.apply(l_channel)
+        merged = cv2.merge((cl, a_channel, b_channel))
+        final_img = cv2.cvtColor(merged, cv2.COLOR_LAB2RGB)
+        return Image.fromarray(final_img)
+
+
 class ChestXrayTestMultiLabelDataset(torch.utils.data.Dataset):
     def __init__(self, csv_file, img_dir, transform=None):
         self.data = pd.read_csv(csv_file)
@@ -64,8 +84,10 @@ class ChestXrayTestMultiLabelDataset(torch.utils.data.Dataset):
 # 3. 測試流程
 # ==========================================
 def evaluate_test_set():
+    # 與訓練一致，保留 CLAHE / Resize / Normalize，只拿掉隨機增強
     test_transforms = transforms.Compose(
         [
+            ApplyCLAHE(),
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
@@ -86,7 +108,6 @@ def evaluate_test_set():
 
     all_labels = []
     all_preds = []
-    all_probs = []
 
     print(f"開始測試 DenseNet-121 ({len(test_loader.dataset)} 張影像)，正在進行多標籤評估...")
 
@@ -100,11 +121,9 @@ def evaluate_test_set():
 
             all_labels.append(labels.cpu().numpy())
             all_preds.append(preds.cpu().numpy())
-            all_probs.append(probs.cpu().numpy())
 
     all_labels = np.vstack(all_labels)
     all_preds = np.vstack(all_preds)
-    all_probs = np.vstack(all_probs)
 
     print("\n" + "=" * 60)
     print("多標籤疾病分類 - DenseNet 測試結果")
