@@ -41,6 +41,7 @@ IMG_SIZE = 224
 BATCH_SIZE = 32
 MAX_EPOCHS = 50
 LEARNING_RATE = 1e-4
+MAX_POS_WEIGHT = 10.0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BEST_MODEL_PATH = "best_densenet_multilabel.pth"
 
@@ -68,7 +69,7 @@ class ApplyCLAHE(object):
 
 
 # ==========================================
-# 2. 提早停止 Early Stopping
+# 2. Early Stopping
 # ==========================================
 class EarlyStopping:
     def __init__(self, patience=15, path=BEST_MODEL_PATH):
@@ -122,6 +123,29 @@ class ChestXrayMultiLabelDataset(Dataset):
         return image, torch.tensor(label_list, dtype=torch.float32)
 
 
+def compute_pos_weights(csv_file):
+    df = pd.read_csv(csv_file)
+    findings = df["Finding Labels"].fillna("")
+    weights = []
+
+    print("\n[根據訓練集自動計算各類別 pos_weight]")
+    print("  公式: pos_weight = negative_count / positive_count")
+    print(f"  為避免極少數類別權重過大，這裡設定上限為 {MAX_POS_WEIGHT:.1f}")
+
+    for disease in ALL_DISEASES:
+        positive_count = findings.str.split("|").apply(lambda labels: disease in labels).sum()
+        negative_count = len(df) - positive_count
+        raw_weight = negative_count / max(positive_count, 1)
+        clipped_weight = min(raw_weight, MAX_POS_WEIGHT)
+        weights.append(clipped_weight)
+        print(
+            f"  - {disease}: positive={positive_count}, negative={negative_count}, "
+            f"raw={raw_weight:.4f}, used={clipped_weight:.4f}"
+        )
+
+    return torch.tensor(weights, dtype=torch.float32, device=DEVICE)
+
+
 # ==========================================
 # 4. 建立模型 DenseNet-121
 # ==========================================
@@ -172,8 +196,7 @@ def train():
     )
 
     model = build_model()
-    # 參考目前 MobileNet 設定，對正樣本提高權重
-    pos_weight = torch.ones([NUM_CLASSES], device=DEVICE) * 10.0
+    pos_weight = compute_pos_weights(TRAIN_CSV)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -188,6 +211,7 @@ def train():
     for epoch in range(MAX_EPOCHS):
         start_time = time.time()
 
+        # --- 訓練階段 ---
         model.train()
         train_loss = 0.0
         for imgs, lbls in train_loader:
@@ -234,7 +258,6 @@ def train():
         all_preds = np.vstack(all_preds)
         all_lbls = np.vstack(all_lbls)
 
-        # 計算每個疾病的 Recall，再取 Macro-Recall
         recalls = []
         for idx in range(NUM_CLASSES):
             tp = ((all_preds[:, idx] == 1) & (all_lbls[:, idx] == 1)).sum()
