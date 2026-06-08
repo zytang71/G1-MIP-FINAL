@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import models, transforms
 
 ALL_DISEASES = [
@@ -176,6 +176,34 @@ def print_train_distribution(csv_file):
         print(f"  - {disease}: {positive_count}")
 
 
+def build_train_sampler(dataset):
+    label_matrix = []
+    for finding_labels in dataset.data["Finding Labels"].fillna("").astype(str):
+        findings = set(finding_labels.split("|"))
+        label_matrix.append([1.0 if disease in findings else 0.0 for disease in ALL_DISEASES])
+
+    label_matrix = np.asarray(label_matrix, dtype=np.float32)
+    class_counts = np.maximum(label_matrix.sum(axis=0), 1.0)
+    class_weights = 1.0 / np.sqrt(class_counts)
+
+    sample_weights = 1.0 + (label_matrix * class_weights).sum(axis=1)
+    negative_mask = label_matrix.sum(axis=1) == 0
+    sample_weights[negative_mask] = 1.0
+
+    sampler = WeightedRandomSampler(
+        weights=torch.as_tensor(sample_weights, dtype=torch.double),
+        num_samples=len(sample_weights),
+        replacement=True,
+    )
+
+    print("\n[Train sampler 類別重加權]")
+    for disease, count, weight in zip(ALL_DISEASES, class_counts, class_weights):
+        print(f"  - {disease}: positives={int(count)}, class_weight={weight:.4f}")
+    print(f"  - No Finding: samples={int(negative_mask.sum())}")
+
+    return sampler
+
+
 def compute_macro_metrics(preds, labels, disease_names):
     precisions = []
     recalls = []
@@ -241,10 +269,12 @@ def train():
         ]
     )
 
+    train_dataset = ChestXrayMultiLabelDataset(TRAIN_CSV, TRAIN_DIR, train_trans)
+    train_sampler = build_train_sampler(train_dataset)
     train_loader = DataLoader(
-        ChestXrayMultiLabelDataset(TRAIN_CSV, TRAIN_DIR, train_trans),
+        train_dataset,
         batch_size=BATCH_SIZE,
-        shuffle=True,
+        sampler=train_sampler,
         num_workers=4,
         pin_memory=torch.cuda.is_available(),
     )

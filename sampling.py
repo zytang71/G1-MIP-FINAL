@@ -5,22 +5,19 @@ import pandas as pd
 # 1. 基本設定
 # ==========================================
 CSV_PATH = "Data_Entry_2017.csv"
-TARGET_TOTAL_SAMPLES = 12500
 TRAIN_RATIO = 0.8
 VALID_RATIO = 0.1
 TEST_RATIO = 0.1
+EVAL_SPLIT_SAMPLES = 1250
 
-# Train 改成更接近真實分布，避免模型被過度平衡的資料帶偏
-TRAIN_NEGATIVE_RATIO = 0.45
+# Train 直接保留完整 split，不再壓縮成小子集
+USE_FULL_TRAIN_SPLIT = True
 
 # Valid / Test 保留較高的陽性覆蓋，方便評估各類別
 EVAL_NEGATIVE_RATIO = 0.20
 
 SPLIT_SEARCH_TRIALS = 300
 BASE_RANDOM_STATE = 42
-
-# Train 抽樣只做「保底」，不再把稀有類別硬塞滿
-TRAIN_MIN_POSITIVE_PER_DISEASE = 60
 
 ALL_DISEASES = [
     "Atelectasis",
@@ -132,19 +129,6 @@ def summarize_sampled_dataset(df, split_name, target_size):
         print(f"    - {disease}: {int(positive_counts[disease])}")
 
 
-def build_positive_sampling_weights(positive_df):
-    label_matrix = positive_df[ALL_DISEASES].to_numpy(dtype=np.float64)
-    class_counts = np.maximum(label_matrix.sum(axis=0), 1.0)
-
-    # 稀有類別加一點權重，但不要像先前 greedy 那樣強制灌滿
-    class_weights = 1.0 / np.sqrt(class_counts)
-    label_counts = np.maximum(label_matrix.sum(axis=1), 1.0)
-
-    sample_weights = 1.0 + (label_matrix * class_weights).sum(axis=1) / np.sqrt(label_counts)
-    sample_weights = np.clip(sample_weights, 1e-8, None)
-    return sample_weights / sample_weights.sum()
-
-
 def choose_seed_indices(label_matrix, min_positive_per_disease):
     selected = set()
 
@@ -171,53 +155,9 @@ def choose_seed_indices(label_matrix, min_positive_per_disease):
     return selected
 
 
-def sample_train_set(data_frame, target_size, split_name, random_state):
-    shuffled = data_frame.sample(frac=1, random_state=random_state).reset_index(drop=True)
-    positive_df = shuffled[shuffled["label_count"] > 0].reset_index(drop=True)
-    negative_df = shuffled[shuffled["label_count"] == 0].reset_index(drop=True)
-
-    target_negatives = min(len(negative_df), int(round(target_size * TRAIN_NEGATIVE_RATIO)))
-    target_positives = min(len(positive_df), target_size - target_negatives)
-
-    label_matrix = positive_df[ALL_DISEASES].to_numpy(dtype=np.int32)
-    seed_indices = choose_seed_indices(label_matrix, TRAIN_MIN_POSITIVE_PER_DISEASE)
-
-    rng = np.random.default_rng(random_state)
-    positive_weights = build_positive_sampling_weights(positive_df)
-
-    remaining_indices = np.array([idx for idx in range(len(positive_df)) if idx not in seed_indices], dtype=np.int32)
-    remaining_slots = max(target_positives - len(seed_indices), 0)
-
-    selected_indices = list(sorted(seed_indices))
-    if remaining_slots > 0 and len(remaining_indices) > 0:
-        remaining_weights = positive_weights[remaining_indices]
-        remaining_weights = remaining_weights / remaining_weights.sum()
-        extra_indices = rng.choice(
-            remaining_indices,
-            size=min(remaining_slots, len(remaining_indices)),
-            replace=False,
-            p=remaining_weights,
-        )
-        selected_indices.extend(sorted(int(idx) for idx in extra_indices))
-
-    selected_positive_df = positive_df.iloc[sorted(set(selected_indices))].copy()
-    selected_negative_df = negative_df.sample(
-        n=target_negatives,
-        random_state=random_state,
-        replace=False,
-    ) if target_negatives > 0 else negative_df.iloc[0:0].copy()
-
-    combined = pd.concat([selected_positive_df, selected_negative_df], ignore_index=True)
-
-    if len(combined) < target_size:
-        used_images = set(combined["Image Index"].tolist())
-        fallback_pool = shuffled[~shuffled["Image Index"].isin(used_images)]
-        fill_count = min(target_size - len(combined), len(fallback_pool))
-        if fill_count > 0:
-            combined = pd.concat([combined, fallback_pool.iloc[:fill_count].copy()], ignore_index=True)
-
-    combined = combined.sample(frac=1, random_state=random_state).reset_index(drop=True)
-    summarize_sampled_dataset(combined, split_name, target_size)
+def prepare_full_train_set(data_frame, split_name, random_state):
+    combined = data_frame.sample(frac=1, random_state=random_state).reset_index(drop=True)
+    summarize_sampled_dataset(combined, split_name, len(combined))
     return combined
 
 
@@ -290,7 +230,7 @@ def main():
     print("=" * 60)
     print("從 NIH Chest X-ray 重新抽樣 14 類多標籤資料")
     print("=" * 60)
-    print("Train: 較自然分布 + 類別保底")
+    print("Train: 保留完整 split")
     print("Valid/Test: 保留每類覆蓋，方便評估")
 
     df = pd.read_csv(CSV_PATH)
@@ -314,12 +254,14 @@ def main():
     print_dataset_stats(valid_df, "切分後原始 Valid")
     print_dataset_stats(test_df, "切分後原始 Test")
 
-    train_size = int(TARGET_TOTAL_SAMPLES * TRAIN_RATIO)
-    valid_size = int(TARGET_TOTAL_SAMPLES * VALID_RATIO)
-    test_size = int(TARGET_TOTAL_SAMPLES * TEST_RATIO)
+    valid_size = EVAL_SPLIT_SAMPLES
+    test_size = EVAL_SPLIT_SAMPLES
 
     print("\n[開始依新策略抽樣...]")
-    train_final = sample_train_set(train_df, train_size, "Train", best_seed)
+    if USE_FULL_TRAIN_SPLIT:
+        train_final = prepare_full_train_set(train_df, "Train", best_seed)
+    else:
+        train_final = train_df.sample(frac=1, random_state=best_seed).reset_index(drop=True)
     valid_final = sample_eval_set(valid_df, valid_size, "Valid", best_seed + 1)
     test_final = sample_eval_set(test_df, test_size, "Test", best_seed + 2)
 
